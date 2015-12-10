@@ -1,0 +1,215 @@
+--- masterfs/src/org/netbeans/modules/masterfs/watcher/LinuxNotifier.java	Mon Apr 25 13:56:13 2011 +0200
++++ masterfs/src/org/netbeans/modules/masterfs/watcher/LinuxNotifier.java	Mon Apr 25 18:11:03 2011 +0200
+@@ -42,10 +42,15 @@ 
+ import com.sun.jna.Library;
+ import com.sun.jna.Native;
+ import com.sun.jna.NativeLibrary;
++import com.sun.jna.NativeLong;
++import com.sun.jna.Structure;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.nio.ByteOrder;
++import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.HashMap;
++import java.util.List;
+ import java.util.Map;
+ import java.util.logging.Level;
+ import java.util.logging.Logger;
+@@ -57,14 +62,43 @@ 
+  */
+ final class LinuxNotifier extends Notifier<LinuxNotifier.LKey> {
+     private static final Logger LOG = Logger.getLogger(LinuxNotifier.class.getName());
++
++    public static class PollFd extends Structure {
++        public int fd;
++        public short events;
++        public short revents;
++        
++        public static final short POLLIN = 0x01; // something to read
++        
++        public PollFd(int fd) {
++            this.fd = fd;
++            events = POLLIN;
++        }
++        
++        public boolean hasData() {
++            return (revents & POLLIN) != 0;
++        }
++
++        @Override
++        public String toString() {
++            return "PollFd[" + fd + "]";
++        }
++        
++    }
++    public static class TimeVal extends Structure {
++        public NativeLong seconds;
++        public NativeLong nano;
++    }
+     
+     private static interface InotifyImpl extends Library {
+-	public int inotify_init();
+-	public int inotify_init1(int flags);
+-	public int close(int fd);
+-    public int read(int fd, ByteBuffer buff, int count);
+-	public int inotify_add_watch(int fd, String pathname, int mask);
+-	public int inotify_rm_watch(int fd, int wd);
++        public int inotify_init();
++        public int inotify_init1(int flags);
++        public int close(int fd);
++        public int poll(PollFd[] fds, NativeLong numberOfFDs, int timeout);
++        public int read(int fd, ByteBuffer buff, int count);
++        public int inotify_add_watch(int fd, String pathname, int mask);
++        public int inotify_rm_watch(int fd, int wd);
++        
+ 
+         public static final int O_CLOEXEC = 02000000; //0x80000
+ 
+@@ -90,7 +124,7 @@ 
+     }
+ 
+     final InotifyImpl IMPL;
+-    int fd;
++    private PollFd[] polls;
+     private ByteBuffer buff = ByteBuffer.allocateDirect(4096);
+ 
+     // An array would serve nearly as well
+@@ -100,18 +134,23 @@ 
+          IMPL = (InotifyImpl) Native.loadLibrary("c", InotifyImpl.class);
+          buff.position(buff.capacity()); // make the buffer empty
+          buff.order(ByteOrder.nativeOrder());
+-         fd = IMPL.inotify_init1(InotifyImpl.O_CLOEXEC);
+-         if (fd < 0) {
+-             LOG.log(
+-                 Level.INFO, "Linux kernel {0} returned {1} from inotify_init1",
+-                 new Object[] { System.getProperty("os.version"), fd }
+-             );
+-             fd = IMPL.inotify_init();
+-             LOG.log(Level.INFO, "Trying inotify_init: {0}", fd);
+-         }
+-         if (fd < 0) {
+-             throw new IllegalStateException("inotify_init failed: " + fd);
+-         }
++         polls = new PollFd[] { new PollFd(allocFD()) };
++    }
++
++    private int allocFD() throws IllegalStateException {
++        int fd = IMPL.inotify_init1(InotifyImpl.O_CLOEXEC);
++        if (fd < 0) {
++            LOG.log(
++                Level.INFO, "Linux kernel {0} returned {1} from inotify_init1",
++                new Object[] { System.getProperty("os.version"), fd }
++            );
++            fd = IMPL.inotify_init();
++            LOG.log(Level.INFO, "Trying inotify_init: {0}", fd);
++        }
++        if (fd < 0) {
++            throw new IllegalStateException("inotify_init failed: " + fd);
++        }
++        return fd;
+     }
+ 
+     private String getString(int maxLen) {
+@@ -133,8 +172,17 @@ 
+          */
+         while (buff.remaining() < 16 || buff.remaining() < 16 + buff.getInt(buff.position() + 12)) {
+             buff.compact();
+-            int len = IMPL.read(fd, buff, buff.remaining());
+-
++            LOG.log(Level.FINEST, "before select from {0}", polls.length);
++            IMPL.poll(polls, new NativeLong(1), -1);
++            LOG.log(Level.FINEST, "before select from {0}", polls.length);
++            int len = -1;
++            for (PollFd fd : polls) {
++                LOG.log(Level.FINEST, "{0}  has data {1}", new Object[]{fd, fd.hasData()});
++                if (fd.hasData()) {
++                    len = IMPL.read(fd.fd, buff, buff.remaining());
++                    break;
++                }
++            }
+             if (len <= 0) {
+                 // lazily get a thread local errno
+                 int errno = NativeLibrary.getInstance("c").getFunction("errno").getInt(0);
+@@ -166,12 +214,14 @@ 
+ 
+ 
+     static class LKey {
+-        int id;
+-        String path;
++        final int id;
++        final String path;
++        final PollFd from;
+ 
+-        public LKey(int id, String path) {
++        public LKey(int id, String path, PollFd from) {
+             this.id = id;
+             this.path = path;
++            this.from = from;
+         }
+ 
+         @Override
+@@ -181,22 +231,43 @@ 
+     }
+ 
+     @Override public LKey addWatch(String path) throws IOException {
+-        // what if the file doesn't exist?
+-        int id = IMPL.inotify_add_watch(fd, path,
+-                    InotifyImpl.IN_CREATE | InotifyImpl.IN_MOVED_TO |
+-                    InotifyImpl.IN_DELETE | InotifyImpl.IN_MOVED_FROM |
+-                    InotifyImpl.IN_MODIFY | InotifyImpl.IN_ATTRIB);
+-        //XXX handle error return value (-1)
+-        LOG.log(Level.FINEST, "addWatch{0} res: {1}", new Object[]{path, id});
+-        if (id <= 0) {
+-            // 28 == EINOSPC
+-            int errno = NativeLibrary.getInstance("c").getFunction("errno").getInt(0); // NOI18N
+-            throw new IOException("addWatch on " + path + " errno: " + errno); // NOI18N
++        int id = -1;
++        PollFd from = null;
++        List<PollFd> arr = Arrays.asList(polls);
++        OK: for (int twice = 0; twice < 2; twice++) {
++            // what if the file doesn't exist?
++            for (PollFd fd : polls) {
++                id = IMPL.inotify_add_watch(fd.fd, path,
++                        InotifyImpl.IN_CREATE | InotifyImpl.IN_MOVED_TO |
++                        InotifyImpl.IN_DELETE | InotifyImpl.IN_MOVED_FROM |
++                        InotifyImpl.IN_MODIFY | InotifyImpl.IN_ATTRIB);
++                //XXX handle error return value (-1)
++                if (id <= 0) {
++                    int errno = NativeLibrary.getInstance("c").getFunction("errno").getInt(0); // NOI18N
++                    LOG.log(Level.FINE, "addWatch error {3}/{1} at {0} on {2}", new Object[]{path, id, fd, errno});
++                    if (errno == 28) {
++                        // 28 == EINOSPC
++                        continue;
++                    }
++                    throw new IOException("addWatch on " + path + " errno: " + errno); // NOI18N
++                }
++                LOG.log(Level.FINEST, "addWatch{0} res: {1} on {2}", new Object[]{path, id, fd});
++                from = fd;
++                break OK;
++            }
++            LOG.log(Level.WARNING, "Expanding list of iNotify instances from {0}", polls.length);
++            synchronized (this) {
++                arr = new ArrayList<PollFd>(arr);
++                final PollFd pollFd = new PollFd(allocFD());
++                arr.add(pollFd);
++                polls = arr.toArray(new PollFd[0]);
++                LOG.log(Level.FINE, "Current polls: {0}", arr);
++            }
+         }
+ 
+         LKey newKey = map.get(id);
+         if (newKey == null) {
+-            newKey = new LKey(id, path);
++            newKey = new LKey(id, path, from);
+             map.put(id, newKey);
+         }
+         return newKey;
+@@ -204,6 +275,6 @@ 
+ 
+     @Override public void removeWatch(LKey lkey) {
+         map.remove(lkey.id);
+-        IMPL.inotify_rm_watch(fd, lkey.id);
++        IMPL.inotify_rm_watch(lkey.from.fd, lkey.id);
+     }
+ }

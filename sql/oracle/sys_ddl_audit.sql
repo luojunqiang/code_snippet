@@ -1,7 +1,8 @@
-drop trigger trig_ddl_audit;
-drop table ddl_audit_log;
 
-create table ddl_audit_log (
+drop trigger trg_sys_ddl_audit;
+drop table sys_ddl_audit_log;
+
+create table sys_ddl_audit_log (
     oper_user   VARCHAR2(30),
     oper_time   TIMESTAMP(3),
     oper_type   VARCHAR2(30),
@@ -17,7 +18,7 @@ create table ddl_audit_log (
     sql_text    VARCHAR2(1000)
 );
 
-create or replace package pkg_audit is
+create or replace package pkg_sys_audit is
     check_danger_ddl boolean := true;
 
     procedure disable_check;
@@ -28,12 +29,18 @@ create or replace package pkg_audit is
         obj_owner varchar2, 
         obj_type varchar2, 
         obj_name varchar2, 
-        rejected varchar2);
-end pkg_audit;
+        rejected varchar2 := 'N');
+    procedure log_rejected_ddl(
+        oper_user varchar2,
+        oper_type varchar2, 
+        obj_owner varchar2, 
+        obj_type varchar2, 
+        obj_name varchar2);
+end pkg_sys_audit;
 /
 show errors
 
-create or replace package body pkg_audit is
+create or replace package body pkg_sys_audit is
     procedure disable_check
     is
     begin
@@ -54,7 +61,6 @@ create or replace package body pkg_audit is
         obj_name varchar2, 
         rejected varchar2)
     is
-        PRAGMA AUTONOMOUS_TRANSACTION;
         sql_text ora_name_list_t;
         sql_count pls_integer;
         sql_stmt varchar2(1000);
@@ -69,7 +75,7 @@ create or replace package body pkg_audit is
             end if;
         end loop;
         
-        insert into ddl_audit_log
+        insert into sys_ddl_audit_log
           (oper_user, oper_time, oper_type, rejected, 
            obj_owner, obj_type, obj_name, os_user, host, 
            ip_addr, program, inst_name, sql_text)
@@ -88,41 +94,51 @@ create or replace package body pkg_audit is
             sys_context('USERENV','INSTANCE_NAME',30),
             sql_stmt --sys_context('USERENV','CURRENT_SQL',1000)
         );
+    end;
+    
+    procedure log_rejected_ddl(
+        oper_user varchar2,
+        oper_type varchar2, 
+        obj_owner varchar2, 
+        obj_type varchar2, 
+        obj_name varchar2)
+    is
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    begin
+        log_ddl(oper_user, oper_type, obj_owner, obj_type, obj_name, 'Y');
         commit;
     end;
 begin
     null;
-end pkg_audit;
+end pkg_sys_audit;
 /
 show errors
 
-create or replace trigger trig_ddl_audit
+create or replace trigger trg_sys_ddl_audit
     before ddl on schema 
 declare
 begin
-    if pkg_audit.check_danger_ddl 
+    if pkg_sys_audit.check_danger_ddl 
         and ora_sysevent in ('DROP', 'TRUNCATE')
         and ora_login_user = ora_dict_obj_owner 
         and ora_dict_obj_type='TABLE' 
         and ora_dict_obj_name not like '%#%'
     then
-        pkg_audit.log_ddl(
+        pkg_sys_audit.log_rejected_ddl(
             ora_login_user,
             ora_sysevent,
             ora_dict_obj_owner,
             ora_dict_obj_type,
-            ora_dict_obj_name,
-            'Y'
+            ora_dict_obj_name
         );
         RAISE_APPLICATION_ERROR(-20999, 'Attempt to '||ora_sysevent||' a production table denied. Please contact DBA!');
     else
-        pkg_audit.log_ddl(
+        pkg_sys_audit.log_ddl(
             ora_login_user,
             ora_sysevent,
             ora_dict_obj_owner,
             ora_dict_obj_type,
-            ora_dict_obj_name,
-            'N'
+            ora_dict_obj_name
         );
     end if;
 end ddl_trigger;
@@ -134,4 +150,4 @@ CREATE TABLE TEST
 drop table test;
 rename test to test#;
 drop table test#;
-select * from ddl_audit_log;
+select * from sys_ddl_audit_log;
